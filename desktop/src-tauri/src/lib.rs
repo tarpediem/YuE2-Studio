@@ -36,9 +36,11 @@ fn studio_data_directory() -> PathBuf {
     // cannot be written to - Program Files, a read-only share - does the studio
     // fall back to AppData, because then it has nowhere else to go.
     // On macOS the executable sits inside a signed .app bundle that must not
-    // be written to, so an installation always uses Application Support.
+    // be written to, so an installation always uses Application Support. A
+    // Linux installation follows the XDG layout the same way, unless it is
+    // portable (the flag above).
     let beside_the_executable = executable_directory().join("data");
-    if !cfg!(target_os = "macos") && directory_is_writable(&beside_the_executable) {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) && directory_is_writable(&beside_the_executable) {
         return beside_the_executable;
     }
 
