@@ -41,9 +41,13 @@ fn tool_folder() -> &'static str {
 }
 
 /// The transcriber that ships inside the macOS app bundle
-/// (`Contents/Resources/resources/music-midi/music-midi`); the downloadable
-/// archive is a Windows build.
+/// (`Contents/Resources/resources/music-midi/music-midi`) or beside the Linux
+/// build (`resources/music-midi/music-midi`); the downloadable archive is a
+/// Windows build.
 fn bundled_tool() -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return crate::engine_runtime::bundled_resource(TOOL_FOLDER, TOOL_FOLDER);
+    }
     if !cfg!(target_os = "macos") {
         return None;
     }

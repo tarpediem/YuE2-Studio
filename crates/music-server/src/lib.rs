@@ -6407,11 +6407,9 @@ async fn transcribe_to_midi(state: &AppState, size: &'static midi::Size, audio: 
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // the CUDA runtime it imports lives beside the engine, as for the trainer
-    let mut paths = vec![engine_bundle_root()];
-    paths.extend(std::env::var_os("PATH").iter().flat_map(std::env::split_paths));
-    if let Ok(path) = std::env::join_paths(paths) {
-        command.env("PATH", path);
+    // the CUDA runtime it imports lives beside the engine, as for the trainer; on Linux it brings its own ggml
+    if let Some((variable, value)) = engine_runtime::library_search_path(&tool, Some(&engine_bundle_root())) {
+        command.env(variable, value);
     }
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);

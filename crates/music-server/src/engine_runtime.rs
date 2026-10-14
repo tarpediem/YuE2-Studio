@@ -15,9 +15,7 @@
 //! Toolkit, which is exactly why this was invisible until someone without the
 //! Toolkit ran the release.
 
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 #[cfg(test)]
@@ -228,6 +226,24 @@ pub fn system_cublas_missing(cuda: Option<CudaBuild>) -> bool {
     false
 }
 
+/// A tool the Linux build carries beside the studio, `<executable folder>/resources/<folder>/<file>`.
+pub fn bundled_resource(folder: &str, file: &str) -> Option<PathBuf> {
+    let tool = std::env::current_exe().ok()?.parent()?.join("resources").join(folder).join(file);
+    tool.is_file().then_some(tool)
+}
+
+/// The search path a native tool needs to find its libraries, as the variable to set on the child and
+/// its value. Windows: the engine's folder (where its CUDA runtime lives) goes first on `PATH`. Linux:
+/// the tool carries its own ggml, so its own folder goes first on `LD_LIBRARY_PATH` and the engine's
+/// copy is never the one it loads; the system loader finds the CUDA toolkit by itself. None when there
+/// is nothing to add.
+pub fn library_search_path(tool: &Path, engine_libraries: Option<&Path>) -> Option<(&'static str, std::ffi::OsString)> {
+    let (variable, first) = if cfg!(target_os = "linux") { ("LD_LIBRARY_PATH", tool.parent()?) } else { ("PATH", engine_libraries?) };
+    let mut paths = vec![first.to_path_buf()];
+    paths.extend(std::env::var_os(variable).iter().flat_map(std::env::split_paths));
+    std::env::join_paths(paths).ok().map(|value| (variable, value))
+}
+
 /// Whether the loader would already find this library without help.
 ///
 /// The engine inherits this process's PATH, so the directories searched there
@@ -382,6 +398,17 @@ mod tests {
         assert!(in_directories("libcublas.so.13", [root.clone()]));
         assert!(!in_directories("libcublasLt.so.13", [root.clone()]));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_tool_looks_in_its_own_folder_on_linux_and_the_engines_elsewhere() {
+        let (variable, value) = library_search_path(Path::new("/opt/tool/music-train"), Some(Path::new("/opt/engine"))).unwrap();
+        let first = std::env::split_paths(&value).next();
+        if cfg!(target_os = "linux") {
+            assert_eq!((variable, first), ("LD_LIBRARY_PATH", Some(PathBuf::from("/opt/tool"))));
+        } else {
+            assert_eq!((variable, first), ("PATH", Some(PathBuf::from("/opt/engine"))));
+        }
     }
 
     #[cfg(target_os = "linux")]

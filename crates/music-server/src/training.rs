@@ -374,10 +374,24 @@ fn pack() -> &'static [Asset] {
     })
 }
 
+/// A tool the Linux build carries in `resources/music-train/`, trainer and captioner together with their
+/// own ggml. Windows downloads them with the pack instead.
+fn bundled_tool(file: &str) -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        crate::engine_runtime::bundled_resource("music-train", file)
+    } else {
+        None
+    }
+}
+
 /// The captioner, beside the trainer whose ggml it shares. Picked out of its
 /// archive by name, so removing it never takes the trainer's folder along.
+#[cfg(windows)]
 const CAPTIONER: &str = "ace-caption.exe";
-/// The captioner with the ggml it was built with, processor builds included:
+#[cfg(not(windows))]
+const CAPTIONER: &str = "ace-caption";
+/// The captioner with the ggml it was built with, processor builds included
+/// (the names of the Windows archive; Linux ships the captioner with the app):
 /// it runs where the training pack, which carries the CUDA build, is not
 /// installed - a machine without an NVIDIA card is not offered that pack.
 const CAPTIONER_PICK: [&str; 12] = [
@@ -456,6 +470,12 @@ fn listen_pack() -> &'static [Asset] {
     })
 }
 
+/// Whether the pack downloads this file. The runtime archives are Windows builds: Linux ships the
+/// trainer and the captioner with the app, and only fetches model weights.
+fn fetchable(asset: &Asset) -> bool {
+    cfg!(windows) || !asset.is_windows_runtime()
+}
+
 fn now() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default()
 }
@@ -502,6 +522,7 @@ impl Training {
     pub fn trainer(&self) -> PathBuf {
         std::env::var_os("YUE_TRAIN_BIN")
             .map(PathBuf::from)
+            .or_else(|| bundled_tool("music-train"))
             .unwrap_or_else(|| self.downloader.runtime_dir(trainer_folder()).join(&trainer_source().shipped_as))
     }
 
@@ -514,6 +535,7 @@ impl Training {
     pub fn captioner(&self) -> PathBuf {
         std::env::var_os("YUE_CAPTION_BIN")
             .map(PathBuf::from)
+            .or_else(|| bundled_tool(CAPTIONER))
             .unwrap_or_else(|| self.downloader.runtime_dir(trainer_folder()).join(CAPTIONER))
     }
 
@@ -545,7 +567,7 @@ impl Training {
     }
 
     pub async fn install_listen(&self) -> Result<()> {
-        let missing: Vec<&'static Asset> = listen_pack().iter().filter(|asset| !self.listen_installed(asset)).collect();
+        let missing: Vec<&'static Asset> = listen_pack().iter().filter(|asset| !self.listen_installed(asset) && fetchable(asset)).collect();
         if missing.is_empty() {
             return Ok(());
         }
@@ -616,7 +638,7 @@ impl Training {
     }
 
     pub async fn install_pack(&self) -> Result<()> {
-        let missing: Vec<&'static Asset> = pack().iter().filter(|asset| !self.installed(asset)).collect();
+        let missing: Vec<&'static Asset> = pack().iter().filter(|asset| !self.installed(asset) && fetchable(asset)).collect();
         if missing.is_empty() {
             return Ok(());
         }
@@ -1232,12 +1254,8 @@ impl Training {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true);
-            if let Some(libraries) = libraries {
-                let mut paths = vec![std::path::PathBuf::from(libraries.as_os_str())];
-                paths.extend(std::env::var_os("PATH").iter().flat_map(std::env::split_paths));
-                if let Ok(path) = std::env::join_paths(paths) {
-                    command.env("PATH", path);
-                }
+            if let Some((variable, value)) = crate::engine_runtime::library_search_path(trainer, libraries) {
+                command.env(variable, value);
             }
             // The pack carries ggml's processor builds beside CUDA; without this
             // a card whose CUDA does not load would train on the processor.

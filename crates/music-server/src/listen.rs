@@ -84,7 +84,8 @@ pub struct Heard {
 /// dataset: the model loads once, and each song's caption is handed to `done`
 /// as soon as it is written, with its index. `libraries` goes first on PATH:
 /// the captioner's ggml-cuda imports cuBLAS from the engine's folder, and
-/// without it ggml would quietly run the whole model on the processor.
+/// without it ggml would quietly run the whole model on the processor. On Linux the captioner
+/// carries its own ggml and its own folder goes first on `LD_LIBRARY_PATH` instead.
 pub fn hear_batch(
     exe: &Path,
     moss: &Path,
@@ -127,12 +128,8 @@ pub fn hear_batch(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
-    if let Some(libraries) = libraries {
-        let mut paths = vec![std::path::PathBuf::from(libraries.as_os_str())];
-        paths.extend(std::env::var_os("PATH").iter().flat_map(std::env::split_paths));
-        if let Ok(path) = std::env::join_paths(paths) {
-            command.env("PATH", path);
-        }
+    if let Some((variable, value)) = crate::engine_runtime::library_search_path(exe, libraries) {
+        command.env(variable, value);
     }
     quiet(&mut command);
     let mut child = command.spawn().with_context(|| format!("start {}", exe.display()))?;
