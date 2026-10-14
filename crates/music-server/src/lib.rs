@@ -1531,7 +1531,7 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
     ]);
     let config = state.separation_config.read().await.clone();
     let mut set: Vec<&'static lyrics_sync::Asset> = Vec::new();
-    if let Some(asset) = lyrics_sync::asset("onnxruntime") { set.push(asset); }
+    if let Some(asset) = onnxruntime_download() { set.push(asset); }
     set.extend(separation_card_assets(config.runtime).iter().filter_map(|id| lyrics_sync::asset(id)));
     let runtime_progress = set_progress(state.lyrics_sync.downloader(), &set);
     let model_installed = state.separator.is_installed();
@@ -1544,9 +1544,11 @@ async fn separation_assets(State(state): State<AppState>) -> Json<Value> {
         "set": {
             "bytes": bytes,
             "installed_bytes": installed_bytes,
-            "ready": installed_bytes == bytes,
+            "ready": installed_bytes == bytes && runtime_installed,
             "files": set.len() + 1,
         },
+        // Linux only: the system library that no download can replace
+        "runtime_error": onnxruntime_missing(&state),
         // Only this panel's own download. The recogniser shares this
         // downloader, and its gigabytes are not the separator's business.
         "active_download": state.separator.downloader().active_for("separation").await.or(state.lyrics_sync.downloader().active_for("separation").await),
@@ -1564,6 +1566,28 @@ struct InstallSeparationAssetRequest {
 /// builds a recogniser out of these plus its own model files, so this is the
 /// one place the CUDA provider's parts are named.
 const CUDA_ASSETS: [&str; 5] = ["onnxruntime-cuda", "cuda-cudart", "cuda-cublas", "cuda-cufft", "cuda-cudnn"];
+
+/// The ONNX Runtime download, where there is one. Linux runs on the system's library and downloads
+/// nothing: the archive is a Windows build.
+fn onnxruntime_download() -> Option<&'static lyrics_sync::Asset> {
+    if cfg!(target_os = "linux") { None } else { lyrics_sync::asset("onnxruntime") }
+}
+
+/// Why a Linux machine cannot run the models that sit on ONNX Runtime.
+const ONNXRUNTIME_REQUIRED: &str = "the system ONNX Runtime is required: install the `onnxruntime-cpu` package so that libonnxruntime.so is in /usr/lib (or point YUE_ONNXRUNTIME_LIB at it)";
+
+/// Linux only: the ONNX Runtime is not installed, and no download can bring it.
+fn onnxruntime_missing(state: &AppState) -> Option<&'static str> {
+    (cfg!(target_os = "linux") && state.lyrics_sync.onnxruntime_library().is_none()).then_some(ONNXRUNTIME_REQUIRED)
+}
+
+/// Refuses an install that needs ONNX Runtime where it can only come from the system.
+fn require_onnxruntime(state: &AppState) -> Result<(), (StatusCode, Json<ApiError>)> {
+    match onnxruntime_missing(state) {
+        Some(reason) => Err(api_error(StatusCode::CONFLICT, reason.into())),
+        None => Ok(()),
+    }
+}
 
 /// The runtime parts work set to `runtime` needs on this machine's card:
 /// CUDA's on an NVIDIA card that runs it, DirectML's on any other card,
@@ -1650,11 +1674,12 @@ async fn install_separation_asset(
     // for the card - the CUDA provider. Six rows of file names asked the user
     // to work out which of them belong together.
     if matches!(request.asset_id.as_str(), "auto" | "cuda" | "cpu") {
+        require_onnxruntime(&state)?;
         let wanted = if request.asset_id == "cpu" { lyrics_sync::OnnxFlavour::Cpu } else { lyrics_sync::OnnxFlavour::Auto };
         let separator = state.separator.clone();
         let sync = state.lyrics_sync.clone();
         let mut runtime: Vec<&'static lyrics_sync::Asset> = Vec::new();
-        if let Some(asset) = lyrics_sync::asset("onnxruntime") { runtime.push(asset); }
+        if let Some(asset) = onnxruntime_download() { runtime.push(asset); }
         runtime.extend(separation_card_assets(wanted).iter().filter_map(|id| lyrics_sync::asset(id)));
         tokio::spawn(async move {
             if let Err(error) = separator.downloader().install_all("separation", &[&separation::MODEL]).await {
@@ -1668,6 +1693,7 @@ async fn install_separation_asset(
         return Ok(Json(serde_json::json!({ "started": true })));
     }
     if request.asset_id == "card" {
+        require_onnxruntime(&state)?;
         let sync = state.lyrics_sync.clone();
         let card: Vec<&'static lyrics_sync::Asset> = separation_card_assets(lyrics_sync::OnnxFlavour::Auto).iter().filter_map(|id| lyrics_sync::asset(id)).collect();
         tokio::spawn(async move {
@@ -1771,11 +1797,12 @@ async fn separation_status(State(state): State<AppState>) -> Json<Value> {
 /// Fetches the separation model. Nothing here downloads on its own; this is the
 /// button, and it also brings the runtime if karaoke has not already.
 async fn install_separation_model(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    require_onnxruntime(&state)?;
     let separator = state.separator.clone();
     let sync = state.lyrics_sync.clone();
     tokio::spawn(async move {
         if sync.onnxruntime_library().is_none() {
-            if let Some(runtime) = lyrics_sync::asset("onnxruntime") {
+            if let Some(runtime) = onnxruntime_download() {
                 let _ = sync.downloader().install(runtime).await;
             }
         }
@@ -2273,7 +2300,7 @@ async fn install_separator(state: &AppState) {
     let separator = state.separator.clone();
     let sync = state.lyrics_sync.clone();
     let mut runtime: Vec<&'static lyrics_sync::Asset> = Vec::new();
-    if let Some(asset) = lyrics_sync::asset("onnxruntime") {
+    if let Some(asset) = onnxruntime_download() {
         runtime.push(asset);
     }
     runtime.extend(separation_card_assets(wanted).iter().filter_map(|id| lyrics_sync::asset(id)));
@@ -2327,7 +2354,12 @@ async fn read_training(State(state): State<AppState>) -> Json<Value> {
         })
         .collect();
     let (pack, separator_ready) = training_pack_files(&state).await;
-    let listen_download = training.downloader().active_for(training::LISTEN_SCOPE).await.filter(|active| !active.done);
+    let listen_download = training
+        .downloader()
+        .active_for(training::LISTEN_SCOPE)
+        .await
+        .filter(|active| !active.done)
+        .or_else(|| listen_blocker(&state).map(blocked_download));
     Json(serde_json::json!({
         "pack": pack,
         "pack_ready": training.pack_ready() && !trainer_cublas_missing(&state),
@@ -2381,6 +2413,13 @@ async fn training_pack_files(state: &AppState) -> (Vec<Value>, bool) {
 /// The training pack's download in progress: its own, the trainer's cuBLAS,
 /// or the separator's, whose files come through their own downloaders.
 async fn training_pack_download(state: &AppState) -> Option<downloads::DownloadProgress> {
+    match training_pack_download_running(state).await {
+        None => training_blocker(state).map(blocked_download),
+        other => other,
+    }
+}
+
+async fn training_pack_download_running(state: &AppState) -> Option<downloads::DownloadProgress> {
     let separator_download = match state.separator.downloader().active_for("separation").await {
         Some(active) if !active.done => Some(active),
         other => state.lyrics_sync.downloader().active_for("separation").await.filter(|active| !active.done).or(other),
@@ -2427,7 +2466,11 @@ async fn training_pack_runtime(State(state): State<AppState>) -> Json<Value> {
 async fn listen_pack_runtime(State(state): State<AppState>) -> Json<Value> {
     let training = &state.training;
     let ready = training.listen_ready() && state.lyrics_sync.onnxruntime_library().is_some();
-    Json(pack_runtime(training.listen_status(), ready, training.downloader().active_for(training::LISTEN_SCOPE).await))
+    let download = match training.downloader().active_for(training::LISTEN_SCOPE).await {
+        None => listen_blocker(&state).map(blocked_download),
+        other => other,
+    };
+    Json(pack_runtime(training.listen_status(), ready, download))
 }
 
 /// Audio to MIDI on the models page: the transcriber, and its sizes as one
@@ -2460,6 +2503,10 @@ async fn install_training_pack(State(state): State<AppState>) -> Result<Json<Val
     if let Some(refusal) = trainer_card_refusal() {
         return Err(api_error(StatusCode::CONFLICT, refusal));
     }
+    // Nothing the pack downloads can supply these, so say so now instead of in the log
+    if let Some(reason) = training_blocker(&state) {
+        return Err(api_error(StatusCode::CONFLICT, reason.into()));
+    }
     let background = state.clone();
     tokio::spawn(async move {
         if let Err(error) = background.training.install_pack().await {
@@ -2477,7 +2524,10 @@ async fn install_training_pack(State(state): State<AppState>) -> Result<Json<Val
 
 /// The optional listening pack, and the ONNX Runtime its tempo model runs
 /// on when nothing else has brought it yet.
-async fn install_listen_pack(State(state): State<AppState>) -> Json<Value> {
+async fn install_listen_pack(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    if let Some(reason) = listen_blocker(&state) {
+        return Err(api_error(StatusCode::CONFLICT, reason.into()));
+    }
     let background = state.clone();
     tokio::spawn(async move {
         if let Err(error) = background.training.install_listen().await {
@@ -2485,13 +2535,13 @@ async fn install_listen_pack(State(state): State<AppState>) -> Json<Value> {
             return;
         }
         if background.lyrics_sync.onnxruntime_library().is_none() {
-            let runtime: Vec<&'static lyrics_sync::Asset> = lyrics_sync::asset("onnxruntime").into_iter().collect();
+            let runtime: Vec<&'static lyrics_sync::Asset> = onnxruntime_download().into_iter().collect();
             if let Err(error) = background.lyrics_sync.downloader().install_all("listen", &runtime).await {
                 eprintln!("[ERROR] ONNX Runtime for the listening pack: {error:#}");
             }
         }
     });
-    Json(serde_json::json!({ "started": true }))
+    Ok(Json(serde_json::json!({ "started": true })))
 }
 
 async fn cancel_training_pack(State(state): State<AppState>) -> Json<Value> {
@@ -2809,6 +2859,46 @@ fn trainer_card_needs() -> Option<&'static str> {
 fn trainer_cublas_missing(state: &AppState) -> bool {
     !state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).is_empty()
         || engine_runtime::system_cublas_missing(Some(hardware::CudaBuild::Cuda13))
+}
+
+/// Linux only: why the training pack cannot be used here although its files may all be on disk - the
+/// trainer is not part of this build, the system toolkit is missing, or ONNX Runtime is. The page shows
+/// it where a download error would be.
+fn training_blocker(state: &AppState) -> Option<&'static str> {
+    if !cfg!(target_os = "linux") || trainer_card_refusal().is_some() {
+        return None;
+    }
+    if !state.training.trainer().is_file() {
+        return Some(training::TOOLS_NOT_BUILT);
+    }
+    if trainer_cublas_missing(state) {
+        return Some(TRAINER_CUBLAS_MISSING);
+    }
+    onnxruntime_missing(state)
+}
+
+/// Linux only: why the listening pack cannot be used - the captioner is not part of this build, or
+/// ONNX Runtime is missing.
+fn listen_blocker(state: &AppState) -> Option<&'static str> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    if !state.training.captioner().is_file() {
+        return Some(training::TOOLS_NOT_BUILT);
+    }
+    onnxruntime_missing(state)
+}
+
+/// A finished download that failed with this reason, so a page that shows download errors shows it.
+fn blocked_download(reason: &str) -> downloads::DownloadProgress {
+    downloads::DownloadProgress {
+        asset_id: downloads::SET.to_string(),
+        scope: None,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        done: true,
+        error: Some(reason.to_string()),
+    }
 }
 
 /// Refuses a run the trainer could not compute on the card.
@@ -4099,6 +4189,15 @@ async fn restart_engine(state: &AppState) -> Result<(), String> {
     for (index, device) in chain.iter().copied().enumerate() {
         let attempt = EngineOptions { backend: device, ..options };
         let cuda = attempt.cuda_build();
+        // Linux has no cuBLAS to fetch: without the system toolkit the CUDA device is unavailable. Auto
+        // moves on to the next device; only an explicit choice of CUDA reports what is missing.
+        if device == music_engine::yue_server::ComputeBackend::Cuda && engine_runtime::system_cublas_missing(cuda) {
+            if options.backend == music_engine::yue_server::ComputeBackend::Auto {
+                music_engine::yue_server::note_in_log(&format!("CUDA is unavailable: {}", engine_runtime::SYSTEM_CUDA_REQUIRED));
+                continue;
+            }
+            return Err(engine_runtime::SYSTEM_CUDA_REQUIRED.into());
+        }
         if !state.engine_runtime.is_ready(cuda) {
             state
                 .engine_runtime
@@ -4791,20 +4890,25 @@ async fn compose_setup_status(state: &AppState, manager_status: model_manager::M
         // an engine that starts in three seconds and one that starts in ten
         // minutes. A spinner that says nothing for ten minutes is the same
         // screen as a spinner that is stuck.
-        let runtime_cuda = state.engine_options.read().await.cuda_build();
+        let runtime_options = *state.engine_options.read().await;
+        let runtime_cuda = runtime_options.cuda_build();
+        // Auto moves on to Vulkan or the processor when the Linux toolkit is missing, so only an explicit
+        // choice of CUDA is held up by it.
+        let cuda_blocked = engine_runtime::system_cublas_missing(runtime_cuda);
+        let falls_back = cuda_blocked && runtime_options.backend == music_engine::yue_server::ComputeBackend::Auto;
         // Linux downloads no cuBLAS; the system CUDA toolkit provides it.
         let runtime_total = runtime_cuda.filter(|_| !cfg!(target_os = "linux")).map(|build| engine_runtime::cublas_asset(build).bytes).unwrap_or(0);
         let runtime_active = state.engine_runtime.downloader().active().await;
         fields.insert(
             "engine_runtime".into(),
             serde_json::json!({
-                "ready": state.engine_runtime.is_ready(runtime_cuda),
+                "ready": falls_back || state.engine_runtime.is_ready(runtime_cuda),
                 "downloading": runtime_active.is_some(),
                 "downloaded_bytes": runtime_active.as_ref().map(|progress| progress.downloaded_bytes).unwrap_or(0),
                 "total_bytes": runtime_total,
                 "error": runtime_active
                     .and_then(|progress| progress.error)
-                    .or_else(|| engine_runtime::system_cublas_missing(runtime_cuda).then(|| engine_runtime::SYSTEM_CUDA_REQUIRED.to_string())),
+                    .or_else(|| (cuda_blocked && !falls_back).then(|| engine_runtime::SYSTEM_CUDA_REQUIRED.to_string())),
             }),
         );
         fields.insert("ready".into(), Value::Bool(selected_set_ready));
@@ -5368,7 +5472,9 @@ fn karaoke_set(name: &str, device: lyrics_sync::OnnxFlavour, whisper_model: Opti
     let mut wanted: Vec<String> = Vec::new();
     match name {
         "parakeet" => {
-            wanted.push("onnxruntime".into());
+            if onnxruntime_download().is_some() {
+                wanted.push("onnxruntime".into());
+            }
             wanted.extend(card_assets(device).iter().map(|id| id.to_string()));
             // The precision is chosen the same way a Whisper model is: through
             // the dropdown, which names one of the encoders.
@@ -5405,6 +5511,9 @@ async fn karaoke_install(
     State(state): State<AppState>,
     Json(request): Json<AssistantAssetRequest>,
 ) -> Result<Json<lyrics_sync::SyncStatus>, (StatusCode, Json<ApiError>)> {
+    if request.asset_id == "parakeet" {
+        require_onnxruntime(&state)?;
+    }
     let config = state.lyrics_sync_config.read().await.clone();
     let set = karaoke_set(
         &request.asset_id,

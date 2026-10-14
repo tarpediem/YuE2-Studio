@@ -476,6 +476,10 @@ fn fetchable(asset: &Asset) -> bool {
     cfg!(windows) || !asset.is_windows_runtime()
 }
 
+/// Why the pack cannot be completed by a download where the app is meant to carry its own tools.
+pub const TOOLS_NOT_BUILT: &str =
+    "the trainer and the captioner are not part of this build: build the studio with scripts/build-arch.sh (they are installed under resources/music-train)";
+
 fn now() -> String {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs().to_string()).unwrap_or_default()
 }
@@ -567,11 +571,16 @@ impl Training {
     }
 
     pub async fn install_listen(&self) -> Result<()> {
-        let missing: Vec<&'static Asset> = listen_pack().iter().filter(|asset| !self.listen_installed(asset) && fetchable(asset)).collect();
-        if missing.is_empty() {
-            return Ok(());
+        let absent: Vec<&'static Asset> = listen_pack().iter().filter(|asset| !self.listen_installed(asset)).collect();
+        let missing: Vec<&'static Asset> = absent.iter().copied().filter(|asset| fetchable(asset)).collect();
+        if !missing.is_empty() {
+            self.downloader.install_all(LISTEN_SCOPE, &missing).await?;
         }
-        self.downloader.install_all(LISTEN_SCOPE, &missing).await
+        // a tool that only the app can carry is not something to wait for
+        if absent.len() > missing.len() {
+            bail!(TOOLS_NOT_BUILT);
+        }
+        Ok(())
     }
 
     fn datasets_dir(&self) -> PathBuf {
@@ -638,12 +647,15 @@ impl Training {
     }
 
     pub async fn install_pack(&self) -> Result<()> {
-        let missing: Vec<&'static Asset> = pack().iter().filter(|asset| !self.installed(asset) && fetchable(asset)).collect();
-        if missing.is_empty() {
-            return Ok(());
+        let absent: Vec<&'static Asset> = pack().iter().filter(|asset| !self.installed(asset)).collect();
+        let missing: Vec<&'static Asset> = absent.iter().copied().filter(|asset| fetchable(asset)).collect();
+        if !missing.is_empty() {
+            self.downloader.install_all(SCOPE, &missing).await?;
+            self.remove_older_trainers();
         }
-        self.downloader.install_all(SCOPE, &missing).await?;
-        self.remove_older_trainers();
+        if absent.len() > missing.len() {
+            bail!(TOOLS_NOT_BUILT);
+        }
         Ok(())
     }
 
@@ -1567,6 +1579,17 @@ pub fn plain_lyrics(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Linux the tools come with the app and only the weights are downloaded; what only the app can
+    /// carry is reported by `install_pack`, not waited for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_downloads_the_weights_but_not_the_windows_tools() {
+        let (tools, weights): (Vec<&Asset>, Vec<&Asset>) = pack().iter().partition(|asset| asset.kind == AssetKind::Runtime);
+        assert!(!tools.is_empty() && !weights.is_empty());
+        assert!(tools.iter().all(|asset| !fetchable(asset)));
+        assert!(weights.iter().all(|asset| fetchable(asset)));
+    }
 
     #[test]
     fn the_trainer_says_what_it_computes_on() {

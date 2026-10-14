@@ -315,9 +315,7 @@ pub async fn describe_song_style(State(state): State<AppState>, Path(song_id): P
     (hooks.take)().await;
     crate::release_assistant_unless_kept(&state).await;
     let heard = async {
-        if crate::hardware::hardware().cuda == Some(crate::hardware::CudaBuild::Cuda13) {
-            state.engine_runtime.install_missing(Some(crate::hardware::CudaBuild::Cuda13)).await.context("install cuBLAS for the captioner")?;
-        }
+        captioner_on_card(&state).await?;
         let (captioner, moss, facts_dir, libraries) = (state.training.captioner(), state.training.moss_dir(), state.training.audio_facts_dir(), crate::engine_bundle_root());
         tokio::task::spawn_blocking(move || -> anyhow::Result<(listen::Heard, audio_facts::Facts)> {
             let facts = audio_facts::Measurer::load(&facts_dir, card)?.measure_mono(&audio_facts::decode(&audio)?)?;
@@ -739,6 +737,18 @@ async fn lyrics_branch(state: &AppState, job: &Job, lyric_items: &[&training::Da
     Ok(sheets.into_iter().chain(transcripts).collect())
 }
 
+/// Makes ready what the captioner's CUDA 13 build needs and says whether it will run on the card. It
+/// does not where the card cannot run that build, nor on Linux without the system toolkit: the
+/// captioner then computes on the processor, as it always has.
+async fn captioner_on_card(state: &AppState) -> anyhow::Result<bool> {
+    let cuda13 = Some(crate::hardware::CudaBuild::Cuda13);
+    if crate::hardware::hardware().cuda != cuda13 || crate::engine_runtime::system_cublas_missing(cuda13) {
+        return Ok(false);
+    }
+    state.engine_runtime.install_missing(cuda13).await.context("install cuBLAS for the captioner")?;
+    Ok(true)
+}
+
 /// The listening: MOSS over every song in one load, the tempo measured
 /// beside it. What it heard is stored with each song the moment it is heard.
 async fn listen_branch(state: &AppState, job: &Job, style_items: &[&training::DatasetItem], can_listen: bool) -> anyhow::Result<()> {
@@ -751,9 +761,7 @@ async fn listen_branch(state: &AppState, job: &Job, style_items: &[&training::Da
         crate::release_assistant_unless_kept(state).await;
         // The captioner is a CUDA 13 build and imports cuBLAS 13 from beside
         // the engine; on a card that build does not run, it runs on the processor
-        if crate::hardware::hardware().cuda == Some(crate::hardware::CudaBuild::Cuda13) {
-            state.engine_runtime.install_missing(Some(crate::hardware::CudaBuild::Cuda13)).await.context("install cuBLAS for the captioner")?;
-        } else {
+        if !captioner_on_card(state).await? {
             update(&shared, |status| status.notices.push("listen_on_cpu"));
         }
         let card = state.lyrics_sync.onnx_card(crate::lyrics_sync::OnnxFlavour::Auto)?;

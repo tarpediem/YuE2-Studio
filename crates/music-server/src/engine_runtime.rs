@@ -32,6 +32,7 @@ pub const CUDA12_LIBRARIES: [&str; 2] = ["cublas64_12.dll", "cublasLt64_12.dll"]
 
 /// The Visual C++ runtime the engine and ggml are compiled against, by the
 /// names in their import tables.
+#[cfg(windows)]
 pub const VC_RUNTIME_LIBRARIES: [&str; 4] =
     ["vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "vcomp140.dll"];
 
@@ -174,7 +175,8 @@ impl EngineRuntime {
 pub const SYSTEM_CUDA_REQUIRED: &str =
     "the system CUDA toolkit is required: install the `cuda` package so that libcublas.so and libcublasLt.so are on the library path";
 
-/// The cuBLAS files each CUDA build links against on Linux, by soname.
+/// The cuBLAS files each CUDA build links against on Linux, by soname. Only the fallback: the sonames the
+/// shipped `libggml-cuda.so` really asks for are read from its dynamic section.
 #[cfg(target_os = "linux")]
 fn linux_libraries(build: CudaBuild) -> [&'static str; 2] {
     match build {
@@ -183,16 +185,10 @@ fn linux_libraries(build: CudaBuild) -> [&'static str; 2] {
     }
 }
 
-/// Where the toolkit puts its libraries when the dynamic loader has not been told about them.
+/// The directories the dynamic loader always searches. The toolkit's own folder (`/opt/cuda/lib64`) is
+/// not one of them: it counts only through `LD_LIBRARY_PATH` or the loader cache.
 #[cfg(target_os = "linux")]
-const SYSTEM_LIBRARY_DIRECTORIES: [&str; 6] = [
-    "/opt/cuda/lib64",
-    "/opt/cuda/targets/x86_64-linux/lib",
-    "/usr/local/cuda/lib64",
-    "/usr/lib",
-    "/usr/lib64",
-    "/usr/lib/x86_64-linux-gnu",
-];
+const SYSTEM_LIBRARY_DIRECTORIES: [&str; 3] = ["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu"];
 
 /// Whether a library sits in one of the directories.
 #[cfg(target_os = "linux")]
@@ -200,27 +196,122 @@ fn in_directories(library: &str, directories: impl IntoIterator<Item = std::path
     directories.into_iter().any(|directory| directory.join(library).is_file())
 }
 
-/// Whether the loader finds the library: `LD_LIBRARY_PATH`, the usual toolkit folders, then the
-/// loader cache.
+/// The loader cache as `ldconfig -p` prints it, read at most every few seconds: the setup status is
+/// polled every second, and installing the toolkit while the studio runs must still be noticed.
+#[cfg(target_os = "linux")]
+fn loader_cache() -> String {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((read_at, text)) = cache.as_ref() {
+        if read_at.elapsed() < Duration::from_secs(20) {
+            return text.clone();
+        }
+    }
+    let text = ["ldconfig", "/sbin/ldconfig", "/usr/sbin/ldconfig"]
+        .iter()
+        .find_map(|program| std::process::Command::new(program).arg("-p").output().ok().filter(|output| output.status.success()))
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    *cache = Some((Instant::now(), text.clone()));
+    text
+}
+
+/// Whether the loader finds the library: `LD_LIBRARY_PATH`, its default folders, then the loader cache
+/// (which also holds the toolkit's folder where the package registered it in `ld.so.conf.d`).
 #[cfg(target_os = "linux")]
 fn is_findable_on_linux(library: &str) -> bool {
-    let from_environment = std::env::var_os("LD_LIBRARY_PATH").map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>()).unwrap_or_default();
+    let from_environment = std::env::var_os("LD_LIBRARY_PATH").map(|paths| std::env::split_paths(&paths).filter(|path| !path.as_os_str().is_empty()).collect::<Vec<_>>()).unwrap_or_default();
     if in_directories(library, from_environment.into_iter().chain(SYSTEM_LIBRARY_DIRECTORIES.iter().map(std::path::PathBuf::from))) {
         return true;
     }
-    std::process::Command::new("ldconfig")
-        .arg("-p")
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).lines().any(|line| line.trim_start().starts_with(library)))
-        .unwrap_or(false)
+    loader_cache().lines().any(|line| line.trim_start().starts_with(library))
 }
 
-/// Linux only: whether the system's cuBLAS for this CUDA build cannot be found. Always false off
-/// Linux, and when no CUDA build runs.
+/// The shared libraries an ELF file lists as needed (`DT_NEEDED`), read from its dynamic section.
+/// None when the file is not a 64-bit little-endian ELF.
+#[cfg(target_os = "linux")]
+pub fn needed_libraries(path: &Path) -> Option<Vec<String>> {
+    elf_needed(&std::fs::read(path).ok()?)
+}
+
+#[cfg(target_os = "linux")]
+fn elf_needed(data: &[u8]) -> Option<Vec<String>> {
+    let number = |offset: usize, width: usize| -> Option<u64> {
+        let bytes = data.get(offset..offset.checked_add(width)?)?;
+        Some(bytes.iter().rev().fold(0u64, |value, byte| (value << 8) | u64::from(*byte)))
+    };
+    // ELF64, little endian
+    if data.get(..4)? != b"\x7fELF" || *data.get(4)? != 2 || *data.get(5)? != 1 {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (number(0x20, 8)? as usize, number(0x36, 2)? as usize, number(0x38, 2)? as usize);
+    let mut dynamic = None;
+    let mut loads = Vec::new();
+    for index in 0..phnum {
+        let header = phoff.checked_add(index.checked_mul(phentsize)?)?;
+        let (kind, offset, address, size) = (number(header, 4)?, number(header + 8, 8)? as usize, number(header + 16, 8)?, number(header + 32, 8)? as usize);
+        match kind {
+            1 => loads.push((address, number(header + 40, 8)?, offset)),
+            2 => dynamic = Some((offset, size)),
+            _ => {}
+        }
+    }
+    let (dynamic_offset, dynamic_size) = dynamic?;
+    let to_offset = |address: u64| loads.iter().find(|(start, length, _)| address >= *start && address < start + length).map(|(start, _, offset)| offset + (address - start) as usize);
+    let (mut needed, mut strings) = (Vec::new(), None);
+    for entry in 0..dynamic_size / 16 {
+        let at = dynamic_offset + entry * 16;
+        let (tag, value) = (number(at, 8)?, number(at + 8, 8)?);
+        match tag {
+            0 => break,
+            1 => needed.push(value as usize),
+            5 => strings = to_offset(value),
+            _ => {}
+        }
+    }
+    let strings = strings?;
+    needed
+        .into_iter()
+        .map(|name| {
+            let tail = data.get(strings.checked_add(name)?..)?;
+            let end = tail.iter().position(|byte| *byte == 0)?;
+            Some(String::from_utf8_lossy(&tail[..end]).into_owned())
+        })
+        .collect()
+}
+
+/// The CUDA toolkit libraries the shipped CUDA backend needs, by what its own dynamic section says;
+/// None when the backend is not beside the studio (a development run), and the build's assumed
+/// sonames apply.
+#[cfg(target_os = "linux")]
+fn backend_toolkit_libraries() -> Option<Vec<String>> {
+    static NEEDED: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    NEEDED
+        .get_or_init(|| {
+            let backend = bundled_resource("yue2-cpp", "libggml-cuda.so").or_else(|| std::env::var_os("YUE_ENGINE_ROOT").map(|root| PathBuf::from(root).join("libggml-cuda.so")).filter(|path| path.is_file()))?;
+            let needed = needed_libraries(&backend)?;
+            let toolkit: Vec<String> = needed.into_iter().filter(|name| ["libcublas", "libcudart", "libnccl"].iter().any(|prefix| name.starts_with(prefix))).collect();
+            (!toolkit.is_empty()).then_some(toolkit)
+        })
+        .clone()
+}
+
+/// The libraries that are missing for the CUDA backend of this build, by soname.
+#[cfg(target_os = "linux")]
+fn missing_linux_libraries(build: CudaBuild) -> Vec<String> {
+    let wanted = backend_toolkit_libraries().unwrap_or_else(|| linux_libraries(build).iter().map(|name| (*name).to_string()).collect());
+    wanted.into_iter().filter(|library| !is_findable_on_linux(library)).collect()
+}
+
+/// Linux only: whether the system's CUDA toolkit libraries for this CUDA build cannot be found. Always
+/// false off Linux, and when no CUDA build runs. The CUDA device is unavailable then: Auto moves on to
+/// Vulkan or the processor, and only an explicit choice of CUDA reports `SYSTEM_CUDA_REQUIRED`.
 pub fn system_cublas_missing(cuda: Option<CudaBuild>) -> bool {
     #[cfg(target_os = "linux")]
     if let Some(build) = cuda {
-        return !linux_libraries(build).iter().all(|library| is_findable_on_linux(library));
+        return !missing_linux_libraries(build).is_empty();
     }
     let _ = cuda;
     false
@@ -239,9 +330,15 @@ pub fn bundled_resource(folder: &str, file: &str) -> Option<PathBuf> {
 /// is nothing to add.
 pub fn library_search_path(tool: &Path, engine_libraries: Option<&Path>) -> Option<(&'static str, std::ffi::OsString)> {
     let (variable, first) = if cfg!(target_os = "linux") { ("LD_LIBRARY_PATH", tool.parent()?) } else { ("PATH", engine_libraries?) };
+    join_search_path(first, std::env::var_os(variable)).map(|value| (variable, value))
+}
+
+/// `first`, then the entries of an existing search path. Empty entries are dropped: on Linux an empty
+/// one means the current directory.
+fn join_search_path(first: &Path, existing: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
     let mut paths = vec![first.to_path_buf()];
-    paths.extend(std::env::var_os(variable).iter().flat_map(std::env::split_paths));
-    std::env::join_paths(paths).ok().map(|value| (variable, value))
+    paths.extend(existing.iter().flat_map(std::env::split_paths).filter(|path| !path.as_os_str().is_empty()));
+    std::env::join_paths(paths).ok()
 }
 
 /// Whether the loader would already find this library without help.
@@ -397,6 +494,27 @@ mod tests {
         std::fs::write(root.join("libcublas.so.13"), b"").unwrap();
         assert!(in_directories("libcublas.so.13", [root.clone()]));
         assert!(!in_directories("libcublasLt.so.13", [root.clone()]));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn empty_search_path_entries_are_dropped() {
+        let joined = join_search_path(Path::new("/opt/tool"), Some(":/usr/lib::".into())).unwrap();
+        assert_eq!(std::env::split_paths(&joined).collect::<Vec<_>>(), vec![PathBuf::from("/opt/tool"), PathBuf::from("/usr/lib")]);
+        let alone = join_search_path(Path::new("/opt/tool"), Some("".into())).unwrap();
+        assert_eq!(std::env::split_paths(&alone).collect::<Vec<_>>(), vec![PathBuf::from("/opt/tool")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_needed_libraries_are_read_from_an_elf_file() {
+        let own = needed_libraries(&std::env::current_exe().unwrap()).expect("the test binary is an ELF file");
+        assert!(own.iter().any(|name| name.starts_with("libc.so")), "{own:?}");
+        let root = std::env::temp_dir().join(format!("yue-elf-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("not-elf"), b"MZ plainly not an ELF file").unwrap();
+        assert_eq!(needed_libraries(&root.join("not-elf")), None);
+        assert_eq!(needed_libraries(&root.join("missing")), None);
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -103,6 +103,9 @@ fn probe() -> &'static Hardware {
         // The CUDA builds of the engine ship for Windows, and a native Linux build brings its own CUDA
         // backend against the system toolkit; the macOS package carries Metal, whatever the card.
         let cuda = if cfg!(any(windows, target_os = "linux")) { device.and_then(|(compute, driver)| cuda_build(compute, driver)) } else { None };
+        // The Linux backend is one build against the CUDA 13 toolkit; a card or driver that only runs
+        // CUDA 12 has no backend there and computes on Vulkan or the processor.
+        let cuda = cuda.filter(|build| !cfg!(target_os = "linux") || *build == CudaBuild::Cuda13);
         let compute_capability = device.map(|(compute, _)| compute);
         Hardware {
             gpu_name,
@@ -169,6 +172,7 @@ pub fn recommended_local_profile() -> &'static str {
 }
 
 fn quiet(program: &str) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {
