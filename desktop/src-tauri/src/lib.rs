@@ -548,6 +548,18 @@ pub fn run() {
     #[cfg(windows)]
     hide_own_console_window();
 
+    // Recent WebKitGTK renders through DMA-BUF, which on Wayland with the
+    // NVIDIA driver kills the window at start with "Error 71 (Protocol error)
+    // dispatching to Wayland display". The shared-memory path works
+    // everywhere; an explicit value in the environment still wins.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        // Still single-threaded here, as below.
+        unsafe {
+            std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+
     if keeps_everything_beside_itself() && std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
         // The process is still single-threaded here, before Tauri or its
         // worker threads are created, so updating its child WebView environment
