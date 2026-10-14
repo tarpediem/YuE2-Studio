@@ -15,6 +15,7 @@ use std::{
 
 const SERVER_PORT: u16 = 8791;
 const RELEASES_URL: &str = "https://github.com/timoncool/YuE2-Studio/releases/latest";
+#[cfg(any(windows, target_os = "macos"))]
 const STUDIO_DATA_DIRECTORY: &str = "YuE2 Studio";
 
 /// Mutable studio data must not be derived from the process working directory
@@ -41,6 +42,12 @@ fn studio_data_directory() -> PathBuf {
     // portable (the flag above).
     let beside_the_executable = executable_directory().join("data");
     if !cfg!(any(target_os = "macos", target_os = "linux")) && directory_is_writable(&beside_the_executable) {
+        return beside_the_executable;
+    }
+    // An earlier Linux install (an extracted AppImage) kept its data here; moving to XDG would silently
+    // hide the models and the library, so a folder that already holds something stays in use.
+    if cfg!(target_os = "linux") && !is_portable() && directory_has_content(&beside_the_executable) {
+        eprintln!("[studio] keeping the existing data folder {}", beside_the_executable.display());
         return beside_the_executable;
     }
 
@@ -174,6 +181,11 @@ fn directory_is_writable(path: &std::path::Path) -> bool {
     let written = std::fs::write(&probe, b"1").is_ok();
     let _ = std::fs::remove_file(&probe);
     written
+}
+
+/// Whether the folder exists and holds anything at all.
+fn directory_has_content(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 /// Hosts the studio service inside this process.
