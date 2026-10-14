@@ -28,6 +28,12 @@ const EXECUTABLE: &str = "yue-server.exe";
 #[cfg(not(windows))]
 const EXECUTABLE: &str = "yue-server";
 
+/// The CUDA backend library ggml loads at run time.
+#[cfg(windows)]
+const CUDA_BACKEND: &str = "ggml-cuda.dll";
+#[cfg(not(windows))]
+const CUDA_BACKEND: &str = "libggml-cuda.so";
+
 /// The weights one engine process serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct YueModelFiles {
@@ -200,16 +206,16 @@ impl YueServerLocation {
 
 impl YueServerLaunchConfig {
     /// The CUDA backend the engine loads. A developer build keeps its one
-    /// `ggml-cuda.dll` beside the executable, which ggml finds by itself; a
+    /// `ggml-cuda.dll` (`libggml-cuda.so` on Linux) beside the executable, which ggml finds by itself; a
     /// release has only the folders, and one missing is a broken install.
     pub fn cuda_backend(&self) -> Result<Option<PathBuf>> {
         let Some(folder) = self.options.cuda_folder else { return Ok(None) };
         let directory = self.executable.parent().context("the engine executable has no folder")?;
-        let backend = directory.join(folder).join("ggml-cuda.dll");
+        let backend = directory.join(folder).join(CUDA_BACKEND);
         if backend.is_file() {
             return Ok(Some(backend));
         }
-        if directory.join("ggml-cuda.dll").is_file() {
+        if directory.join(CUDA_BACKEND).is_file() {
             return Ok(None);
         }
         bail!("the engine's CUDA backend {} is missing; reinstall the studio", backend.display())
@@ -621,10 +627,10 @@ mod tests {
         // A release without the folder is broken, never quietly off CUDA.
         assert!(config(Some("cuda12")).cuda_backend().is_err());
         fs::create_dir_all(root.join("cuda12")).unwrap();
-        fs::write(root.join("cuda12").join("ggml-cuda.dll"), b"x").unwrap();
-        assert_eq!(config(Some("cuda12")).cuda_backend().unwrap(), Some(root.join("cuda12").join("ggml-cuda.dll")));
+        fs::write(root.join("cuda12").join(CUDA_BACKEND), b"x").unwrap();
+        assert_eq!(config(Some("cuda12")).cuda_backend().unwrap(), Some(root.join("cuda12").join(CUDA_BACKEND)));
         // A developer build: the one backend beside the executable.
-        fs::write(root.join("ggml-cuda.dll"), b"x").unwrap();
+        fs::write(root.join(CUDA_BACKEND), b"x").unwrap();
         assert_eq!(config(Some("cuda13")).cuda_backend().unwrap(), None);
         fs::remove_dir_all(&root).ok();
     }

@@ -100,9 +100,9 @@ fn probe() -> &'static Hardware {
             },
         };
         let device = if nvidia { nvidia_cuda_device() } else { None };
-        // The CUDA builds of the engine and their cuBLAS ship for Windows only; the Linux package
-        // carries the Vulkan engine and the macOS one Metal, whatever the card.
-        let cuda = if cfg!(windows) { device.and_then(|(compute, driver)| cuda_build(compute, driver)) } else { None };
+        // The CUDA builds of the engine ship for Windows, and a native Linux build brings its own CUDA
+        // backend against the system toolkit; the macOS package carries Metal, whatever the card.
+        let cuda = if cfg!(any(windows, target_os = "linux")) { device.and_then(|(compute, driver)| cuda_build(compute, driver)) } else { None };
         let compute_capability = device.map(|(compute, _)| compute);
         Hardware {
             gpu_name,
@@ -452,6 +452,8 @@ mod tests {
         // GTX 1660 Super on a current driver: device code from CUDA 13.
         assert_eq!(cuda_build((7, 5), 581), Some(CudaBuild::Cuda13));
         assert_eq!(cuda_build((12, 0), 590), Some(CudaBuild::Cuda13));
+        // An RTX 3080 Ti on a current Linux driver.
+        assert_eq!(cuda_build((8, 6), 610), Some(CudaBuild::Cuda13));
         // Pascal and Maxwell, which CUDA 13 dropped, on any driver.
         assert_eq!(cuda_build((6, 1), 581), Some(CudaBuild::Cuda12));
         assert_eq!(cuda_build((5, 2), 560), Some(CudaBuild::Cuda12));

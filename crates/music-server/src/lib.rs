@@ -691,31 +691,26 @@ impl EngineOptions {
         if self.backend != ComputeBackend::Auto {
             return vec![self.backend];
         }
-        // Off Windows the engine is a single native build whose ggml loads its
-        // own best device - Metal on Apple Silicon - so Auto asks the engine
-        // to choose (no GGML_BACKEND is set) and only falls back to the
-        // processor if that start fails.
-        #[cfg(not(windows))]
-        {
+        // On macOS, and on Linux without a CUDA card, the engine is a single native build whose ggml loads
+        // its own best device - Metal on Apple Silicon - so Auto asks the engine to choose (no GGML_BACKEND
+        // is set) and only falls back to the processor if that start fails.
+        let hardware = hardware::hardware();
+        if cfg!(not(windows)) && !(cfg!(target_os = "linux") && hardware.cuda.is_some()) {
             let mut chain = vec![ComputeBackend::Auto];
             chain.retain(|device| !failed.contains(device));
             chain.push(ComputeBackend::Cpu);
             return chain;
         }
-        #[cfg(windows)]
-        {
-            let hardware = hardware::hardware();
-            let mut chain = Vec::new();
-            if hardware.cuda.is_some() {
-                chain.push(ComputeBackend::Cuda);
-            }
-            if hardware.gpu_name.is_some() {
-                chain.push(ComputeBackend::Vulkan);
-            }
-            chain.retain(|device| !failed.contains(device));
-            chain.push(ComputeBackend::Cpu);
-            chain
+        let mut chain = Vec::new();
+        if hardware.cuda.is_some() {
+            chain.push(ComputeBackend::Cuda);
         }
+        if hardware.gpu_name.is_some() {
+            chain.push(ComputeBackend::Vulkan);
+        }
+        chain.retain(|device| !failed.contains(device));
+        chain.push(ComputeBackend::Cpu);
+        chain
     }
 
     fn to_engine(self) -> music_engine::yue_server::YueServerOptions {
@@ -2364,7 +2359,8 @@ async fn read_training(State(state): State<AppState>) -> Json<Value> {
 async fn training_pack_files(state: &AppState) -> (Vec<Value>, bool) {
     let separator_ready = vocal_separator(state).await.is_some();
     let mut pack = state.training.pack_status();
-    if trainer_card_refusal().is_none() {
+    // Linux brings no cuBLAS of its own: the system CUDA toolkit provides it, so there is nothing to list.
+    if trainer_card_refusal().is_none() && !cfg!(target_os = "linux") {
         let cublas = engine_runtime::cublas_asset(hardware::CudaBuild::Cuda13);
         pack.push(serde_json::json!({
             "id": cublas.id,
@@ -2812,6 +2808,7 @@ fn trainer_card_needs() -> Option<&'static str> {
 /// from beside the engine, which fetches it only for a CUDA 13 run of its own.
 fn trainer_cublas_missing(state: &AppState) -> bool {
     !state.engine_runtime.missing(Some(hardware::CudaBuild::Cuda13)).is_empty()
+        || engine_runtime::system_cublas_missing(Some(hardware::CudaBuild::Cuda13))
 }
 
 /// Refuses a run the trainer could not compute on the card.
@@ -2828,7 +2825,11 @@ fn trainer_ready(state: &AppState) -> Result<(), String> {
 /// Why this machine does not train.
 const TRAINING_NEEDS_CUDA: &str = "training runs on an NVIDIA card with CUDA only, and this machine has none";
 /// Why a run cannot start before the training pack is complete.
+#[cfg(not(target_os = "linux"))]
 const TRAINER_CUBLAS_MISSING: &str = "the training files are not downloaded yet: the trainer needs NVIDIA cuBLAS 13; download the training pack";
+/// On Linux the trainer loads the system's cuBLAS 13; there is no pack file to download for it.
+#[cfg(target_os = "linux")]
+const TRAINER_CUBLAS_MISSING: &str = "the trainer needs NVIDIA cuBLAS 13 from the system CUDA toolkit: install the `cuda` package so that libcublas.so.13 is on the library path";
 
 async fn card_free_of_training(state: &AppState, what: &str) -> Result<(), (StatusCode, Json<ApiError>)> {
     if state.training.active_run().await.is_some() {
@@ -4791,7 +4792,8 @@ async fn compose_setup_status(state: &AppState, manager_status: model_manager::M
         // minutes. A spinner that says nothing for ten minutes is the same
         // screen as a spinner that is stuck.
         let runtime_cuda = state.engine_options.read().await.cuda_build();
-        let runtime_total = runtime_cuda.map(|build| engine_runtime::cublas_asset(build).bytes).unwrap_or(0);
+        // Linux downloads no cuBLAS; the system CUDA toolkit provides it.
+        let runtime_total = runtime_cuda.filter(|_| !cfg!(target_os = "linux")).map(|build| engine_runtime::cublas_asset(build).bytes).unwrap_or(0);
         let runtime_active = state.engine_runtime.downloader().active().await;
         fields.insert(
             "engine_runtime".into(),
@@ -4800,7 +4802,9 @@ async fn compose_setup_status(state: &AppState, manager_status: model_manager::M
                 "downloading": runtime_active.is_some(),
                 "downloaded_bytes": runtime_active.as_ref().map(|progress| progress.downloaded_bytes).unwrap_or(0),
                 "total_bytes": runtime_total,
-                "error": runtime_active.and_then(|progress| progress.error),
+                "error": runtime_active
+                    .and_then(|progress| progress.error)
+                    .or_else(|| engine_runtime::system_cublas_missing(runtime_cuda).then(|| engine_runtime::SYSTEM_CUDA_REQUIRED.to_string())),
             }),
         );
         fields.insert("ready".into(), Value::Bool(selected_set_ready));
@@ -8710,13 +8714,18 @@ mod tests {
             assert_eq!(options.device_chain(&[device]), vec![device]);
         }
         // Auto always ends on the processor and never retries a failed device.
-        // Off Windows the chain starts from Auto itself - the engine's own
-        // best device, Metal on macOS - so only the CUDA/Vulkan failures of a
-        // Windows chain remove entries before it.
+        // Where CUDA is known (Windows, or Linux on a CUDA card) the chain is
+        // explicit; elsewhere it starts from Auto itself - the engine's own
+        // best device, Metal on macOS - so only the CUDA/Vulkan failures of an
+        // explicit chain remove entries before it.
         let auto = EngineOptions::default();
         let chain = auto.device_chain(&[ComputeBackend::Cuda, ComputeBackend::Vulkan]);
-        if cfg!(windows) {
+        let explicit = cfg!(windows) || (cfg!(target_os = "linux") && hardware::hardware().cuda.is_some());
+        if explicit {
             assert_eq!(chain, vec![ComputeBackend::Cpu]);
+            if cfg!(target_os = "linux") {
+                assert_eq!(auto.device_chain(&[]).first(), Some(&ComputeBackend::Cuda));
+            }
         } else {
             assert_eq!(chain, vec![ComputeBackend::Auto, ComputeBackend::Cpu]);
         }

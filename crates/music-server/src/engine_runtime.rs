@@ -117,7 +117,7 @@ impl EngineRuntime {
     /// but no redistributable has nothing to download and still cannot start
     /// the engine.
     pub fn is_ready(&self, cuda: Option<CudaBuild>) -> bool {
-        self.missing(cuda).is_empty() && self.vc_runtime_missing().is_empty()
+        self.missing(cuda).is_empty() && self.vc_runtime_missing().is_empty() && !system_cublas_missing(cuda)
     }
 
     /// The Visual C++ runtime ships inside the engine bundle, app-local as
@@ -146,6 +146,11 @@ impl EngineRuntime {
     /// Toolkit installation - downloads nothing: the engine inherits that path
     /// and finds them there.
     pub fn missing(&self, cuda: Option<CudaBuild>) -> Vec<&'static Asset> {
+        // The cuBLAS archives are Windows builds: on Linux the system CUDA toolkit provides it, and
+        // `system_cublas_missing` says when it does not.
+        if cfg!(target_os = "linux") {
+            return Vec::new();
+        }
         let Some(build) = cuda else { return Vec::new() };
         let asset = cublas_asset(build);
         if self.downloader.is_installed(asset) || asset.pick.iter().all(|library| is_on_the_search_path(library)) {
@@ -156,12 +161,71 @@ impl EngineRuntime {
 
     /// Fetches whatever is missing and waits for it.
     pub async fn install_missing(&self, cuda: Option<CudaBuild>) -> Result<()> {
+        if system_cublas_missing(cuda) {
+            bail!("{SYSTEM_CUDA_REQUIRED}");
+        }
         let absent = self.vc_runtime_missing();
         if !absent.is_empty() {
             bail!("the engine bundle is incomplete: {} missing beside yue-server.exe; reinstall the studio", absent.join(", "));
         }
         self.downloader.install_all("engine", &self.missing(cuda)).await
     }
+}
+
+/// Why a Linux machine without cuBLAS cannot compute on CUDA. Nothing is downloaded there.
+pub const SYSTEM_CUDA_REQUIRED: &str =
+    "the system CUDA toolkit is required: install the `cuda` package so that libcublas.so and libcublasLt.so are on the library path";
+
+/// The cuBLAS files each CUDA build links against on Linux, by soname.
+#[cfg(target_os = "linux")]
+fn linux_libraries(build: CudaBuild) -> [&'static str; 2] {
+    match build {
+        CudaBuild::Cuda13 => ["libcublas.so.13", "libcublasLt.so.13"],
+        CudaBuild::Cuda12 => ["libcublas.so.12", "libcublasLt.so.12"],
+    }
+}
+
+/// Where the toolkit puts its libraries when the dynamic loader has not been told about them.
+#[cfg(target_os = "linux")]
+const SYSTEM_LIBRARY_DIRECTORIES: [&str; 6] = [
+    "/opt/cuda/lib64",
+    "/opt/cuda/targets/x86_64-linux/lib",
+    "/usr/local/cuda/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/lib/x86_64-linux-gnu",
+];
+
+/// Whether a library sits in one of the directories.
+#[cfg(target_os = "linux")]
+fn in_directories(library: &str, directories: impl IntoIterator<Item = std::path::PathBuf>) -> bool {
+    directories.into_iter().any(|directory| directory.join(library).is_file())
+}
+
+/// Whether the loader finds the library: `LD_LIBRARY_PATH`, the usual toolkit folders, then the
+/// loader cache.
+#[cfg(target_os = "linux")]
+fn is_findable_on_linux(library: &str) -> bool {
+    let from_environment = std::env::var_os("LD_LIBRARY_PATH").map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>()).unwrap_or_default();
+    if in_directories(library, from_environment.into_iter().chain(SYSTEM_LIBRARY_DIRECTORIES.iter().map(std::path::PathBuf::from))) {
+        return true;
+    }
+    std::process::Command::new("ldconfig")
+        .arg("-p")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).lines().any(|line| line.trim_start().starts_with(library)))
+        .unwrap_or(false)
+}
+
+/// Linux only: whether the system's cuBLAS for this CUDA build cannot be found. Always false off
+/// Linux, and when no CUDA build runs.
+pub fn system_cublas_missing(cuda: Option<CudaBuild>) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(build) = cuda {
+        return !linux_libraries(build).iter().all(|library| is_findable_on_linux(library));
+    }
+    let _ = cuda;
+    false
 }
 
 /// Whether the loader would already find this library without help.
@@ -309,6 +373,31 @@ pub fn unresolved_dependencies(directory: &Path, entry_point: &str) -> Result<Ve
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_library_is_found_in_the_directory_that_holds_it() {
+        let root = std::env::temp_dir().join(format!("yue-cublas-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("libcublas.so.13"), b"").unwrap();
+        assert!(in_directories("libcublas.so.13", [root.clone()]));
+        assert!(!in_directories("libcublasLt.so.13", [root.clone()]));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nothing_is_ever_downloaded_for_cublas_on_linux() {
+        let runtime = EngineRuntime::new(&std::env::temp_dir());
+        assert!(runtime.missing(Some(CudaBuild::Cuda13)).is_empty());
+        assert!(runtime.missing(Some(CudaBuild::Cuda12)).is_empty());
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn the_system_cublas_is_never_asked_for_off_linux() {
+        assert!(!system_cublas_missing(Some(CudaBuild::Cuda13)));
+    }
+
     /// The file names are the contract with the engine binary: they are what
     /// the import table asks the loader for, and what `pick` takes out of the
     /// archive. A typo here is a download that finishes and changes nothing.
@@ -418,7 +507,8 @@ mod tests {
         }
         assert!(runtime.downloader().is_installed(asset));
         // The other build asks for its own cuBLAS, unless PATH has it.
-        if !CUDA12_LIBRARIES.iter().all(|library| is_on_the_search_path(library)) {
+        // (Linux fetches nothing: see `nothing_is_ever_downloaded_for_cublas_on_linux`.)
+        if cfg!(not(target_os = "linux")) && !CUDA12_LIBRARIES.iter().all(|library| is_on_the_search_path(library)) {
             assert_eq!(runtime.missing(Some(CudaBuild::Cuda12)).len(), 1);
         }
         std::fs::remove_dir_all(&root).ok();
