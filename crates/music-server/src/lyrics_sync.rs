@@ -846,7 +846,8 @@ impl OnnxFlavour {
     /// driver that runs CUDA does. An AMD card was sent to the CUDA provider
     /// and failed, after being offered gigabytes of CUDA libraries.
     pub fn uses_cuda(self) -> bool {
-        !matches!(self, OnnxFlavour::Cpu) && crate::hardware::hardware().cuda.is_some()
+        // Linux uses the system's ONNX Runtime, a processor build: there is no card path to offer.
+        cfg!(not(target_os = "linux")) && !matches!(self, OnnxFlavour::Cpu) && crate::hardware::hardware().cuda.is_some()
     }
 
     /// Whether work runs on the card through DirectML: every card CUDA does
@@ -854,7 +855,7 @@ impl OnnxFlavour {
     /// long as there is a card at all.
     pub fn uses_directml(self) -> bool {
         let hardware = crate::hardware::hardware();
-        !matches!(self, OnnxFlavour::Cpu) && hardware.cuda.is_none() && hardware.gpu_name.is_some()
+        cfg!(not(target_os = "linux")) && !matches!(self, OnnxFlavour::Cpu) && hardware.cuda.is_none() && hardware.gpu_name.is_some()
     }
 
     /// The card path this choice takes on this machine; none is the processor.
@@ -1965,6 +1966,15 @@ mod tests {
         std::fs::write(root.join("libonnxruntime.so"), b"").unwrap();
         assert_eq!(find_onnxruntime(&[root.clone()]), Some(root.join("libonnxruntime.so")));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_runs_onnx_on_the_processor_whatever_the_card() {
+        for flavour in [OnnxFlavour::Auto, OnnxFlavour::Cuda, OnnxFlavour::Cpu] {
+            assert!(!flavour.uses_cuda() && !flavour.uses_directml());
+            assert_eq!(flavour.card(), None);
+        }
     }
 
     #[test]
