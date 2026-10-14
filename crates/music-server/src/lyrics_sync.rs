@@ -949,6 +949,10 @@ pub fn with_card(builder: ort::session::builder::SessionBuilder, card: Option<On
 /// later load of that name gets.
 fn point_ort_at(runtime: &Path, card: Option<OnnxCard>) {
     unsafe { std::env::set_var("ORT_DYLIB_PATH", runtime) };
+    // Linux resolves a library's dependencies through its own RPATH, and PATH is `:` separated there.
+    if cfg!(not(windows)) {
+        return;
+    }
     let Some(directory) = runtime.parent() else { return };
     let existing = std::env::var("PATH").unwrap_or_default();
     unsafe { std::env::set_var("PATH", format!("{};{existing}", directory.display())) };
@@ -973,6 +977,32 @@ fn preload(library: &Path) {
 
 #[cfg(not(windows))]
 fn preload(_library: &Path) {}
+
+/// The system's ONNX Runtime on Linux: `YUE_ONNXRUNTIME_LIB`, else the library the distribution
+/// package installs (`/usr/lib/libonnxruntime.so`, the versioned name when there is no plain one).
+#[cfg(target_os = "linux")]
+fn system_onnxruntime() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("YUE_ONNXRUNTIME_LIB").map(PathBuf::from) {
+        return path.is_file().then_some(path);
+    }
+    find_onnxruntime(&["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"].map(PathBuf::from))
+}
+
+#[cfg(target_os = "linux")]
+fn find_onnxruntime(directories: &[PathBuf]) -> Option<PathBuf> {
+    directories.iter().find_map(|directory| {
+        let mut found: Vec<PathBuf> = std::fs::read_dir(directory)
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name == "libonnxruntime.so" || name.starts_with("libonnxruntime.so.")))
+            .filter(|path| path.is_file())
+            .collect();
+        // the plain name sorts first
+        found.sort();
+        found.into_iter().next()
+    })
+}
 
 /// Every Parakeet file, because the model is useless without all of them.
 pub const PARAKEET_ASSET_IDS: [&str; 5] =
@@ -1102,6 +1132,11 @@ impl LyricsSync {
     /// setting: the build for this machine's card when every file of it is
     /// there - it carries the processor provider too - else the processor build.
     pub fn machine_runtime(&self) -> Option<(PathBuf, Option<OnnxCard>)> {
+        // The downloadable builds are Windows ones: on Linux the system's ONNX Runtime, on the processor.
+        #[cfg(target_os = "linux")]
+        return system_onnxruntime().map(|library| (library, None));
+        #[cfg(not(target_os = "linux"))]
+        {
         let cuda = self.downloader.runtime_dir("onnx-cuda").join("onnxruntime.dll");
         let directml = self.downloader.runtime_dir("onnx-dml").join("onnxruntime.dll");
         let cpu = self.downloader.runtime_dir("onnx").join("onnxruntime.dll");
@@ -1111,6 +1146,7 @@ impl LyricsSync {
             _ => {}
         }
         [cpu, cuda, directml].into_iter().find(|library| library.is_file()).map(|library| (library, None))
+        }
     }
 
     /// The DirectML build and the DirectML it is built for, side by side.
@@ -1915,6 +1951,21 @@ fn hide_console(_command: &mut Command) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_onnxruntime_is_the_plain_library_or_the_versioned_one() {
+        let root = std::env::temp_dir().join(format!("ort-{}", uuid::Uuid::now_v7().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(find_onnxruntime(&[root.clone()]), None);
+        std::fs::write(root.join("libonnxruntime_providers_shared.so"), b"").unwrap();
+        assert_eq!(find_onnxruntime(&[root.clone()]), None);
+        std::fs::write(root.join("libonnxruntime.so.1.25.0"), b"").unwrap();
+        assert_eq!(find_onnxruntime(&[root.clone()]), Some(root.join("libonnxruntime.so.1.25.0")));
+        std::fs::write(root.join("libonnxruntime.so"), b"").unwrap();
+        assert_eq!(find_onnxruntime(&[root.clone()]), Some(root.join("libonnxruntime.so")));
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn whisper_fillers_are_dropped_and_sung_lines_kept() {
