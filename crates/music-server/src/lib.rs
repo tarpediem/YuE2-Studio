@@ -1593,6 +1593,10 @@ fn require_onnxruntime(state: &AppState) -> Result<(), (StatusCode, Json<ApiErro
 /// CUDA's on an NVIDIA card that runs it, DirectML's on any other card,
 /// none on the processor.
 fn card_assets(runtime: lyrics_sync::OnnxFlavour) -> &'static [&'static str] {
+    // Linux: the system package carries the provider; the Windows archives are never offered.
+    if cfg!(target_os = "linux") {
+        return &[];
+    }
     match runtime.card() {
         Some(lyrics_sync::OnnxCard::Cuda) => &CUDA_ASSETS,
         Some(lyrics_sync::OnnxCard::DirectMl) => &lyrics_sync::DIRECTML_ASSETS,
@@ -1610,6 +1614,9 @@ fn separates_on(card: lyrics_sync::OnnxCard) -> bool {
 
 /// The runtime parts separation needs on this machine's card.
 fn separation_card_assets(runtime: lyrics_sync::OnnxFlavour) -> &'static [&'static str] {
+    if cfg!(target_os = "linux") {
+        return &[];
+    }
     if runtime.card().is_some_and(separates_on) { &CUDA_ASSETS } else { &[] }
 }
 
@@ -3213,7 +3220,12 @@ async fn ensure_local_recogniser(state: &AppState, config: &lyrics_sync::LyricsS
         _ => Vec::new(),
     };
     if missing.is_empty() {
-        return ready(state);
+        let ok = ready(state);
+        if !ok && cfg!(target_os = "linux") && config.provider == lyrics_sync::AsrProvider::Whisper {
+            let title = state.library.get_song(song_id).ok().flatten().map(|song| song.title).unwrap_or_default();
+            note_activity(state, song_id, &title, "karaoke", "failed", Some(lyrics_sync::WHISPER_CLI_REQUIRED.into())).await;
+        }
+        return ok;
     }
 
     let title = state.library.get_song(song_id).ok().flatten().map(|song| song.title).unwrap_or_default();
@@ -5374,6 +5386,21 @@ async fn karaoke_status(State(state): State<AppState>) -> Json<Value> {
         if config.provider == lyrics_sync::AsrProvider::OpenRouter {
             progress["ready"] = Value::Bool(credentials::openrouter_source().is_some());
         }
+        // Linux Whisper is the system's CLI: ready when it exists, nothing to download, weights come on first run
+        if cfg!(target_os = "linux") && config.provider == lyrics_sync::AsrProvider::Whisper {
+            let found = state.lyrics_sync.whisper_binary().is_some();
+            progress["ready"] = Value::Bool(found);
+            if found {
+                let cached = lyrics_sync::openai_whisper_cache().is_dir();
+                progress["note"] = Value::from(if cached {
+                    "Whisper uses the system CLI; a model missing from ~/.cache/whisper is downloaded on first run".to_string()
+                } else {
+                    "Whisper uses the system CLI; its model is downloaded on first run".to_string()
+                });
+            } else {
+                progress["note"] = Value::from(lyrics_sync::WHISPER_CLI_REQUIRED);
+            }
+        }
         fields.insert("set".into(), progress);
     }
     Json(value)
@@ -5382,6 +5409,10 @@ async fn karaoke_status(State(state): State<AppState>) -> Json<Value> {
 /// What choosing this recogniser model downloads: its own file and the ones that come with it
 /// (a Parakeet encoder's decoder, vocabulary and, for fp32, its weights; a Whisper model's folder).
 fn karaoke_variant_bytes(id: &str) -> Option<u64> {
+    // Linux Whisper downloads nothing through the studio
+    if cfg!(target_os = "linux") && id.starts_with("whisper-") {
+        return None;
+    }
     let files: Vec<&'static lyrics_sync::Asset> = if id.starts_with("parakeet-") {
         let (ids, _) = lyrics_sync::parakeet_variant(Some(id));
         if !ids.first().is_some_and(|first| *first == id) {
@@ -5480,6 +5511,8 @@ fn karaoke_set(name: &str, device: lyrics_sync::OnnxFlavour, whisper_model: Opti
             // the dropdown, which names one of the encoders.
             wanted.extend(lyrics_sync::parakeet_variant(whisper_model).0.iter().map(|id| id.to_string()));
         }
+        // Linux runs OpenAI's whisper CLI from pipx, which fetches its weights itself: nothing to download.
+        "whisper" if cfg!(target_os = "linux") => {}
         "whisper" => {
             // One binary whichever device is chosen; the card needs CUDA 11's
             // libraries beside it, and without them CTranslate2 silently uses
@@ -5552,6 +5585,12 @@ async fn karaoke_install(
         return Ok(Json(state.lyrics_sync.status(&config).await));
     }
 
+    if cfg!(target_os = "linux") && request.asset_id == "whisper" {
+        return match state.lyrics_sync.whisper_binary() {
+            Some(_) => Ok(Json(state.lyrics_sync.status(&config).await)),
+            None => Err(api_error(StatusCode::CONFLICT, lyrics_sync::WHISPER_CLI_REQUIRED.into())),
+        };
+    }
     let asset = lyrics_sync::asset(&request.asset_id)
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, format!("unknown karaoke asset: {}", request.asset_id)))?;
     state
@@ -8747,6 +8786,17 @@ fn api_error(status: StatusCode, error: String) -> (StatusCode, Json<ApiError>) 
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_offers_no_windows_downloads_for_whisper_or_the_card() {
+        for device in [lyrics_sync::OnnxFlavour::Auto, lyrics_sync::OnnxFlavour::Cuda, lyrics_sync::OnnxFlavour::Cpu] {
+            assert!(super::card_assets(device).is_empty());
+            assert!(super::separation_card_assets(device).is_empty());
+            assert!(super::karaoke_set("whisper", device, Some("whisper-large-v3-turbo")).is_empty());
+        }
+        assert_eq!(super::karaoke_variant_bytes("whisper-large-v3"), None);
+    }
+
     use super::*;
 
     #[test]

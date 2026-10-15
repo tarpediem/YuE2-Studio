@@ -625,6 +625,7 @@ fn refuse_foreign_runtime(asset: &Asset) -> Result<()> {
 
 /// The first executable named `name` in the given flavour directories, in
 /// preference order - a GPU build before a CPU one.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn locate_binary(root: &Path, flavours: &[&str], name: &str) -> Option<PathBuf> {
     let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
     for flavour in flavours {

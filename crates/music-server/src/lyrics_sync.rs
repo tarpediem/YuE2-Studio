@@ -73,6 +73,54 @@ pub const NO_WORDS: &str = "karaoke.no-words";
 pub const WHISPER_RUNTIME_DIR: &str = "whisper";
 
 /// The model sizes the recogniser knows, as `--model` names them.
+/// The Windows faster-whisper engine and its CUDA libraries: never offered on Linux.
+pub const WINDOWS_WHISPER_PARTS: [&str; 3] = ["whisper-engine", "whisper-cublas", "whisper-cudnn"];
+
+/// Why a Linux machine cannot run Whisper.
+pub const WHISPER_CLI_REQUIRED: &str = "Whisper is not installed: run `pipx install openai-whisper` (or point YUE_WHISPER_BIN at the whisper command)";
+
+/// Whether Whisper runs on the card: a CUDA card (the CLI's torch decides at run time, and the processor answers its refusal).
+pub fn whisper_on_card(runtime: OnnxFlavour) -> bool {
+    if cfg!(target_os = "linux") {
+        !matches!(runtime, OnnxFlavour::Cpu) && crate::hardware::hardware().cuda.is_some()
+    } else {
+        runtime.uses_cuda()
+    }
+}
+
+/// The OpenAI name of a model size.
+pub fn openai_whisper_name(size: &str) -> &str {
+    match size {
+        "large-v3-turbo" => "turbo",
+        other => other,
+    }
+}
+
+/// Where openai-whisper keeps its weights (`~/.cache/whisper`, or under XDG_CACHE_HOME).
+pub fn openai_whisper_cache() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"));
+    base.join("whisper")
+}
+
+/// `YUE_WHISPER_BIN`, else `whisper` on PATH, else the usual user-level folders (a GUI session's PATH is short).
+#[cfg(target_os = "linux")]
+fn linux_whisper_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("YUE_WHISPER_BIN").map(PathBuf::from).filter(|path| !path.as_os_str().is_empty()) {
+        return path.is_file().then_some(path);
+    }
+    let mut directories: Vec<PathBuf> = std::env::var_os("PATH").map(|path| std::env::split_paths(&path).filter(|dir| !dir.as_os_str().is_empty()).collect()).unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        directories.push(home.join(".local/bin"));
+    }
+    directories.push(PathBuf::from("/usr/local/bin"));
+    directories.push(PathBuf::from("/usr/bin"));
+    directories.into_iter().map(|dir| dir.join("whisper")).find(|path| path.is_file())
+}
+
 pub const WHISPER_SIZES: &[&str] = &["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"];
 
 /// Phrases Whisper writes over music and silence instead of saying it heard
@@ -846,8 +894,11 @@ impl OnnxFlavour {
     /// driver that runs CUDA does. An AMD card was sent to the CUDA provider
     /// and failed, after being offered gigabytes of CUDA libraries.
     pub fn uses_cuda(self) -> bool {
-        // Linux uses the system's ONNX Runtime, a processor build: there is no card path to offer.
-        cfg!(not(target_os = "linux")) && !matches!(self, OnnxFlavour::Cpu) && crate::hardware::hardware().cuda.is_some()
+        if cfg!(target_os = "linux") {
+            // Linux uses the system's ONNX Runtime: the card path exists only when that package ships the CUDA provider.
+            return !matches!(self, OnnxFlavour::Cpu) && crate::hardware::hardware().cuda.is_some() && system_onnxruntime_has_cuda();
+        }
+        !matches!(self, OnnxFlavour::Cpu) && crate::hardware::hardware().cuda.is_some()
     }
 
     /// Whether work runs on the card through DirectML: every card CUDA does
@@ -952,6 +1003,9 @@ fn point_ort_at(runtime: &Path, card: Option<OnnxCard>) {
     unsafe { std::env::set_var("ORT_DYLIB_PATH", runtime) };
     // Linux resolves a library's dependencies through its own RPATH, and PATH is `:` separated there.
     if cfg!(not(windows)) {
+        if card == Some(OnnxCard::Cuda) {
+            preload_cudnn();
+        }
         return;
     }
     let Some(directory) = runtime.parent() else { return };
@@ -979,6 +1033,26 @@ fn preload(library: &Path) {
 #[cfg(not(windows))]
 fn preload(_library: &Path) {}
 
+/// The distribution's CUDA provider does not list cuDNN among its dependencies, so its symbols
+/// (`cudnnGetConvolutionBackwardDataAlgorithm_v7`...) are undefined unless the library is already
+/// in the process, global. Loaded here once, before the provider is registered; a missing cuDNN
+/// is left for the registration to report, and the work falls back to the processor.
+#[cfg(target_os = "linux")]
+fn preload_cudnn() {
+    use std::ffi::{c_char, c_int, c_void};
+    unsafe extern "C" {
+        fn dlopen(name: *const c_char, flags: c_int) -> *mut c_void;
+    }
+    const RTLD_NOW: c_int = 2;
+    const RTLD_GLOBAL: c_int = 0x100;
+    // leaked on purpose: the library stays loaded for the life of the process
+    if unsafe { dlopen(c"libcudnn.so.9".as_ptr(), RTLD_NOW | RTLD_GLOBAL) }.is_null() {
+        eprintln!("[ERROR] libcudnn.so.9 could not be loaded, the CUDA provider will not register");
+    }
+}
+#[cfg(not(target_os = "linux"))]
+fn preload_cudnn() {}
+
 /// The system's ONNX Runtime on Linux: `YUE_ONNXRUNTIME_LIB`, else the library the distribution
 /// package installs (`/usr/lib/libonnxruntime.so`, the versioned name when there is no plain one).
 #[cfg(target_os = "linux")]
@@ -987,6 +1061,24 @@ fn system_onnxruntime() -> Option<PathBuf> {
         return path.is_file().then_some(path);
     }
     find_onnxruntime(&["/usr/lib", "/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/usr/local/lib"].map(PathBuf::from))
+}
+
+/// Whether the CUDA execution provider sits beside the system ONNX Runtime.
+#[cfg(target_os = "linux")]
+fn system_onnxruntime_has_cuda() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| system_onnxruntime().is_some_and(|library| provider_beside(&library)))
+}
+#[cfg(not(target_os = "linux"))]
+fn system_onnxruntime_has_cuda() -> bool {
+    false
+}
+
+/// `libonnxruntime_providers_cuda.so` in the folder of the loaded library.
+#[cfg(target_os = "linux")]
+fn provider_beside(library: &Path) -> bool {
+    let library = library.canonicalize().unwrap_or_else(|_| library.to_path_buf());
+    library.parent().is_some_and(|dir| dir.join("libonnxruntime_providers_cuda.so").is_file())
 }
 
 #[cfg(target_os = "linux")]
@@ -1066,6 +1158,9 @@ impl LyricsSync {
     /// The CUDA build first: on a machine that has one, the CPU build would be
     /// a silent downgrade.
     pub fn whisper_binary(&self) -> Option<PathBuf> {
+        #[cfg(target_os = "linux")]
+        return linux_whisper_binary();
+        #[cfg(not(target_os = "linux"))]
         crate::downloads::locate_binary(self.downloader.root(), &[WHISPER_RUNTIME_DIR], "whisper-faster")
     }
 
@@ -1085,8 +1180,13 @@ impl LyricsSync {
     pub fn installed_models(&self) -> Vec<&'static Asset> {
         ASSETS
             .iter()
-            .filter(|asset| asset.kind == AssetKind::Model && self.downloader.is_installed(asset))
+            .filter(|asset| asset.kind == AssetKind::Model && (self.downloader.is_installed(asset) || self.linux_whisper_model(asset)))
             .collect()
+    }
+
+    /// Linux: every Whisper size is usable once the CLI exists (it downloads the weights itself).
+    fn linux_whisper_model(&self, asset: &Asset) -> bool {
+        cfg!(target_os = "linux") && asset.vram_gb.is_some() && Self::whisper_size(asset.id).is_some() && self.whisper_binary().is_some()
     }
 
     /// Parakeet needs every one of its files and the ONNX Runtime library.
@@ -1104,6 +1204,9 @@ impl LyricsSync {
     /// arrived. Asking whether that path is a file said no to a complete
     /// installation, which is how a finished download still refused to run.
     pub fn whisper_model_ready(&self, config: &LyricsSyncConfig) -> bool {
+        if cfg!(target_os = "linux") {
+            return self.whisper_binary().is_some() && self.whisper_model_path(config).is_some();
+        }
         self.whisper_model_path(config).is_some_and(|path| path.is_dir())
     }
 
@@ -1135,7 +1238,10 @@ impl LyricsSync {
     pub fn machine_runtime(&self) -> Option<(PathBuf, Option<OnnxCard>)> {
         // The downloadable builds are Windows ones: on Linux the system's ONNX Runtime, on the processor.
         #[cfg(target_os = "linux")]
-        return system_onnxruntime().map(|library| (library, None));
+        return system_onnxruntime().map(|library| {
+            let card = (OnnxFlavour::Auto.card() == Some(OnnxCard::Cuda)).then_some(OnnxCard::Cuda);
+            (library, card)
+        });
         #[cfg(not(target_os = "linux"))]
         {
         let cuda = self.downloader.runtime_dir("onnx-cuda").join("onnxruntime.dll");
@@ -1159,6 +1265,8 @@ impl LyricsSync {
     /// Whether every library the card's provider needs is installed.
     pub fn has_card_libraries(&self, card: OnnxCard) -> bool {
         match card {
+            // Linux: the system package carries the provider, there is nothing to download.
+            OnnxCard::Cuda if cfg!(target_os = "linux") => system_onnxruntime_has_cuda(),
             OnnxCard::Cuda => self.has_cuda_libraries(),
             OnnxCard::DirectMl => self.has_directml_libraries(),
         }
@@ -1206,6 +1314,10 @@ impl LyricsSync {
     /// missing its tokenizer loads exactly as far as an error message.
     fn whisper_model_path(&self, config: &LyricsSyncConfig) -> Option<PathBuf> {
         let size = Self::whisper_size(config.whisper_model.as_deref()?)?;
+        // openai-whisper fetches and caches its own weights on first use: nothing to check here.
+        if cfg!(target_os = "linux") {
+            return Some(openai_whisper_cache());
+        }
         let prefix = format!("models/whisper/faster-whisper-{size}/");
         let parts: Vec<&'static Asset> = ASSETS.iter().filter(|asset| asset.relative_path.starts_with(&prefix)).collect();
         if parts.is_empty() || !parts.iter().all(|asset| self.downloader.is_installed(asset)) {
@@ -1232,7 +1344,12 @@ impl LyricsSync {
             whisper_model: config.whisper_model.clone(),
             openrouter_model: config.openrouter_model.clone(),
             installed_models: self.installed_models().iter().map(|asset| asset.id.to_string()).collect(),
-            assets: self.downloader.status_of(ASSETS),
+            assets: self
+                .downloader
+                .status_of(ASSETS)
+                .into_iter()
+                .filter(|asset| !(cfg!(target_os = "linux") && WINDOWS_WHISPER_PARTS.contains(&asset.id)))
+                .collect(),
             active_download: self.downloader.active_for("karaoke").await,
         }
     }
@@ -1311,7 +1428,7 @@ impl LyricsSync {
         heard: &mut dyn FnMut(usize, Result<Vec<(f64, String)>>),
         cancel: &AtomicBool,
     ) -> Result<Recognised> {
-        let binary = self.whisper_binary().ok_or_else(|| anyhow!("the Whisper runtime is not installed"))?;
+        let binary = self.whisper_binary().ok_or_else(|| anyhow!(if cfg!(target_os = "linux") { WHISPER_CLI_REQUIRED } else { "the Whisper runtime is not installed" }))?;
         let size = config
             .whisper_model
             .as_deref()
@@ -1351,7 +1468,7 @@ impl LyricsSync {
                 heard(index, if words.is_empty() { Err(anyhow!(NO_WORDS)) } else { Ok(words) });
             }
         };
-        let on_card = config.runtime.uses_cuda();
+        let on_card = whisper_on_card(config.runtime);
         let all: Vec<PathBuf> = wavs.iter().map(|(_, wav)| wav.clone()).collect();
         let mut outcome = self.run_whisper_many(&binary, size, &all, &out_dir, language, on_card, &mut || take(&mut answered), cancel);
         let mut recognised = Recognised::OnDevice;
@@ -1389,7 +1506,7 @@ impl LyricsSync {
     /// and wrote nothing at all, so the only thing anyone ever saw was
     /// "whisper-cli produced no LRC file".
     pub fn whisper_words(&self, config: &LyricsSyncConfig, audio: &Path, language: Option<&str>, _lyrics: &str) -> Result<Vec<(f64, String)>> {
-        let binary = self.whisper_binary().ok_or_else(|| anyhow!("the Whisper runtime is not installed"))?;
+        let binary = self.whisper_binary().ok_or_else(|| anyhow!(if cfg!(target_os = "linux") { WHISPER_CLI_REQUIRED } else { "the Whisper runtime is not installed" }))?;
         let size = config
             .whisper_model
             .as_deref()
@@ -1409,7 +1526,7 @@ impl LyricsSync {
         fs::remove_dir_all(&out_dir).ok();
         fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
 
-        let on_card = config.runtime.uses_cuda();
+        let on_card = whisper_on_card(config.runtime);
         let mut outcome = self.run_whisper(&binary, size, &wav, &out_dir, language, on_card);
         // CTranslate2 fails inside itself on a machine without usable CUDA, so
         // the card is tried and the processor is the answer to its refusal -
@@ -1464,6 +1581,21 @@ impl LyricsSync {
         cancel: &AtomicBool,
     ) -> Result<()> {
         let mut command = Command::new(binary);
+        if cfg!(target_os = "linux") {
+            // OpenAI's whisper CLI: it reuses ~/.cache/whisper and writes <stem>.json into the output folder.
+            command
+                .args(wavs)
+                .arg("--model")
+                .arg(openai_whisper_name(size))
+                .args(["--task", "transcribe", "--output_format", "json", "--word_timestamps", "True", "--verbose", "False"])
+                .arg("--output_dir")
+                .arg(out_dir)
+                .arg("--device")
+                .arg(if on_card { "cuda" } else { "cpu" })
+                .arg("--fp16")
+                .arg(if on_card { "True" } else { "False" })
+                .args(["--condition_on_previous_text", "False"]);
+        } else {
         command
             .args(wavs)
             .arg("--model")
@@ -1486,17 +1618,18 @@ impl LyricsSync {
             // A hallucination fed back as the next window's prompt is how one
             // subtitler's credit becomes eight; lyrics lose nothing by it
             .args(["--condition_on_previous_text", "False"]);
+        }
         // A language it was told beats one it has to guess, and "auto" is not a
         // language code - passing it as one is how a run comes back empty.
         if let Some(code) = language.map(str::trim).filter(|code| !code.is_empty() && *code != "auto") {
             command.arg("--language").arg(code);
         }
-        command
+        if !cfg!(target_os = "linux") {
             // The weights are on this disk; a recogniser that goes looking for
             // them on the network is one that fails without one.
-            .env("HF_HUB_OFFLINE", "1")
-            .env("TRANSFORMERS_OFFLINE", "1")
-            .stdin(Stdio::null());
+            command.env("HF_HUB_OFFLINE", "1").env("TRANSFORMERS_OFFLINE", "1");
+        }
+        command.stdin(Stdio::null());
         // Its output goes to a file: a pipe nobody reads while it works through
         // a whole dataset fills up and stalls it.
         let log_path = out_dir.with_extension("log");
@@ -1504,7 +1637,7 @@ impl LyricsSync {
         command.stdout(log.try_clone()?).stderr(log);
         // CTranslate2 and the CUDA libraries sit beside the binary, and that is
         // where they are found from.
-        if let Some(directory) = binary.parent() {
+        if let Some(directory) = binary.parent().filter(|_| cfg!(not(target_os = "linux"))) {
             command.current_dir(directory);
         }
         hide_console(&mut command);
@@ -1970,11 +2103,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn linux_runs_onnx_on_the_processor_whatever_the_card() {
+    fn linux_never_uses_directml_and_cpu_stays_on_the_processor() {
         for flavour in [OnnxFlavour::Auto, OnnxFlavour::Cuda, OnnxFlavour::Cpu] {
-            assert!(!flavour.uses_cuda() && !flavour.uses_directml());
-            assert_eq!(flavour.card(), None);
+            assert!(!flavour.uses_directml());
         }
+        assert_eq!(OnnxFlavour::Cpu.card(), None);
+        // the card path follows the provider library, never a download
+        assert_eq!(OnnxFlavour::Auto.card().is_some(), system_onnxruntime_has_cuda() && crate::hardware::hardware().cuda.is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cuda_provider_is_detected_beside_the_library() {
+        let root = std::env::temp_dir().join(format!("yue-ort-provider-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let library = root.join("libonnxruntime.so.1.29.0");
+        std::fs::write(&library, b"").unwrap();
+        assert!(!provider_beside(&library));
+        std::fs::write(root.join("libonnxruntime_providers_cuda.so"), b"").unwrap();
+        assert!(provider_beside(&library));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -2194,6 +2342,70 @@ mod live_recognition {
             eprintln!("  {at:.2}s {word}");
         }
         assert!(!words.is_empty(), "nothing was recognised");
+    }
+
+    /// Linux: the system ONNX Runtime with its CUDA provider takes a real session on the card.
+    /// Run by hand: `cargo test -p music-server --locked -- --ignored ort_cuda_provider_runs_a_real_model --nocapture`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn ort_cuda_provider_runs_a_real_model() {
+        // a one-node ONNX graph: y = x + x on four floats
+        const ADD: [u8; 61] = [
+            8, 8, 58, 53, 10, 14, 10, 1, 120, 10, 1, 120, 18, 1, 121, 34, 3, 65, 100, 100, 18, 1, 103, 90, 15, 10, 1, 120, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 4, 98, 15, 10, 1,
+            121, 18, 10, 10, 8, 8, 1, 18, 4, 10, 2, 8, 4, 66, 2, 16, 13,
+        ];
+        let root = std::env::temp_dir().join(format!("yue-ort-cuda-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let model = root.join("add.onnx");
+        std::fs::write(&model, ADD).unwrap();
+        let sync = LyricsSync::new(&root);
+        let card = sync.bind_ort().expect("a system ONNX Runtime");
+        eprintln!("bound card: {card:?}");
+        assert_eq!(card, Some(OnnxCard::Cuda), "the CUDA provider should be offered");
+        let (mut builder, took) = with_card(ort::session::Session::builder().unwrap(), card);
+        assert!(took, "the CUDA provider did not register");
+        let mut session = builder.commit_from_file(&model).expect("load the model on the card");
+        let input = ort::value::Value::from_array(([4usize], vec![1f32, 2.0, 3.0, 4.0])).unwrap();
+        let outputs = session.run(ort::inputs!["x" => input]).expect("run");
+        let (_, data) = outputs[0].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(data, &[2.0, 4.0, 6.0, 8.0]);
+        eprintln!("ran on the CUDA provider: {data:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Linux: the real openai-whisper CLI over a short track (`YUE_TEST_TRACK`), parsed into words.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore]
+    fn linux_whisper_cli_end_to_end() {
+        let track = std::env::var_os("YUE_TEST_TRACK").expect("YUE_TEST_TRACK");
+        let root = std::env::temp_dir().join(format!("yue-whisper-{}", std::process::id()));
+        let sync = LyricsSync::new(&root);
+        let config = LyricsSyncConfig {
+            enabled: true,
+            provider: AsrProvider::Whisper,
+            whisper_model: Some(std::env::var("YUE_TEST_MODEL").unwrap_or_else(|_| "whisper-large-v3".into())),
+            runtime: OnnxFlavour::Auto,
+            ..Default::default()
+        };
+        eprintln!("binary: {:?}, ready: {}", sync.whisper_binary(), sync.whisper_model_ready(&config));
+        assert!(sync.whisper_model_ready(&config));
+        let started = std::time::Instant::now();
+        let words = sync.whisper_words(&config, std::path::Path::new(&track), None, "").expect("recognition");
+        eprintln!("{} words in {:?}", words.len(), started.elapsed());
+        for (at, word) in words.iter().take(10) {
+            eprintln!("  {at:.2}s {word}");
+        }
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!words.is_empty());
+    }
+
+    #[test]
+    fn openai_whisper_names() {
+        assert_eq!(openai_whisper_name("large-v3-turbo"), "turbo");
+        assert_eq!(openai_whisper_name("large-v3"), "large-v3");
+        assert_eq!(openai_whisper_name("medium"), "medium");
     }
 
     /// A chorus sung twice, heard worse the first time, and one of its lines
